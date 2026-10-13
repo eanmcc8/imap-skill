@@ -1,24 +1,33 @@
+"""imap-skill — Universal IMAP/SMTP client, CLI and provider schemas.
+
+Debloated: direct IMAP connection per client (no pool/keepalive thread),
+fixed STARTTLS + SMTP defaults + HTML escaping, deduplicated reply/forward/draft paths.
+Public API unchanged: ImapClient, dispatch_tool, canonical_tools_for_provider,
+compile_tools, CLI tools, DEFAULT_MAX_BODY_CHARS.
+"""
+
+import getpass
+import html
+import imaplib as _imaplib_mod  # noqa: F401  (kept for Time2Internaldate check path)
+import json
+import logging
+import mimetypes
 import os
 import re
-import json
 import ssl
 import sys
 import time
-import logging
 import uuid
-import threading
-import mimetypes
-import getpass
-import socket
-from typing import Any, Dict, List, Optional
 from email.header import decode_header
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from email.utils import parsedate_to_datetime, getaddresses, formatdate
+from email.mime.text import MIMEText
+from email.utils import formatdate, getaddresses
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 try:
-    import imaplib, email
+    import imaplib
+    import email
     HAVE_IMAP = True
 except Exception:  # pragma: no cover - interpreter without imaplib/email
     HAVE_IMAP = False
@@ -28,11 +37,10 @@ except Exception:  # pragma: no cover - interpreter without imaplib/email
 
 # ---------- bootstrap: .env + logging ----------
 
-# Keys whose values are safe to strip a trailing "# comment" from.
-# Secrets (IMAP_USER/IMAP_PASSWORD/…) are deliberately excluded: a password
-# may legitimately contain '#'.
 _STRIP_COMMENT_KEYS = {
     "IMAP_HOST", "IMAP_PORT", "IMAP_USE_SSL", "IMAP_TIMEOUT",
+    "IMAP_REQUIRE_ID", "IMAP_BACKUP_DIR",
+    "SMTP_HOST", "SMTP_PORT", "SMTP_USE_SSL",
     "MAX_BODY_CHARS", "LOG_LEVEL",
 }
 
@@ -62,17 +70,24 @@ def _load_dotenv() -> None:
                     continue
                 key, _, val = line.partition("=")
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
+                val = val.strip()
                 if key in _STRIP_COMMENT_KEYS:
-                    # env.example lines carry trailing "# comment" text; a copy/paste
-                    # into .env must not poison numeric/boolean settings.
-                    # (Never applied to secrets like IMAP_PASSWORD, which may
-                    # legitimately contain '#'.)
                     val = val.split("#", 1)[0].strip().strip('"').strip("'")
                 elif key == "IMAP_USER":
-                    # Email logins never contain whitespace: tolerate a pasted
-                    # trailing comment ("user@gmail.com  # my account").
                     val = re.split(r"\s+#", val, maxsplit=1)[0].strip().strip('"').strip("'")
+                elif key in ("IMAP_PASSWORD", "SMTP_PASSWORD", "SMTP_USER"):
+                    # Secrets may legitimately contain '#', so never split on it.
+                    # But support a quoted secret with trailing comment:
+                    #   IMAP_PASSWORD="s#cret"  # my note  ->  s#cret
+                    if val[:1] in ("'", '"'):
+                        q = val[0]
+                        end = val.find(q, 1)
+                        if end > 0:
+                            val = val[1:end]
+                        else:
+                            val = val.strip('"').strip("'")
+                else:
+                    val = val.strip('"').strip("'")
                 if key and key not in os.environ:
                     os.environ[key] = val
     except Exception:
@@ -83,15 +98,13 @@ _load_dotenv()
 
 
 def _env_int(name: str, default: int) -> int:
-    """Parse an int env var tolerantly ('8000  # comment' → 8000)."""
-    from logging import getLogger as _getLogger
     token = _env_token(name, "")
     if not token:
         return default
     try:
         return int(token)
     except ValueError:
-        _getLogger("email_skill").warning(
+        logging.getLogger("email_skill").warning(
             "Invalid %s=%r; using default %d", name, os.getenv(name), default)
         return default
 
@@ -105,24 +118,17 @@ LOG = logging.getLogger("email_skill")
 
 DEFAULT_MAX_BODY_CHARS = _env_int("MAX_BODY_CHARS", 8000)
 DEFAULT_TIMEOUT = _env_int("IMAP_TIMEOUT", 30)
-MAX_FETCH_LIMIT = 100  # clamp for search_messages limit
+MAX_FETCH_LIMIT = 100
 TRUNCATION_SUFFIX = "… (truncated)"
 
-# Connection pooling settings
-CONNECTION_POOL_SIZE = _env_int("IMAP_POOL_SIZE", 2)
-CONNECTION_IDLE_TIMEOUT = _env_int("IMAP_IDLE_TIMEOUT", 300)  # 5 minutes
-
-# IMAP ID support (for 126/163 NetEase)
 IMAP_REQUIRE_ID = _env_token("IMAP_REQUIRE_ID", "false").lower() in ("1", "true", "yes", "y")
 
-# SMTP settings
 SMTP_HOST = _env_token("SMTP_HOST", "")
 SMTP_PORT = _env_int("SMTP_PORT", 465)
 SMTP_USE_SSL = _env_token("SMTP_USE_SSL", "true").lower() in ("1", "true", "yes", "y")
 SMTP_USER = _env_token("SMTP_USER", "")
 SMTP_PASSWORD = _env_token("SMTP_PASSWORD", "")
 
-# Offline backup settings
 BACKUP_DIR = _env_token("IMAP_BACKUP_DIR", str(Path.home() / "imap_backup"))
 
 
@@ -157,17 +163,17 @@ def _decode_mime(s: Any) -> str:
     return " ".join(p for p in out if p)
 
 
-def _extract_plain_text(msg: "email.message.Message") -> str:
-    """Extract first non-attachment text/plain body; '' when none."""
+def _extract_body_part(msg: "email.message.Message", content_type: str) -> str:
+    """First non-attachment part of content_type; '' when none."""
     try:
         if msg.is_multipart():
             for part in msg.walk():
                 if part.is_multipart():
-                    continue  # container, not content
-                if part.get_content_type() != "text/plain":
+                    continue
+                if part.get_content_type() != content_type:
                     continue
                 if part.get_content_disposition() == "attachment":
-                    continue  # real attachment, not body
+                    continue
                 payload = part.get_payload(decode=True)
                 if not payload:
                     continue
@@ -178,11 +184,11 @@ def _extract_plain_text(msg: "email.message.Message") -> str:
                 except Exception:
                     continue
             return ""
+        if content_type != "text/plain" and msg.get_content_type() != content_type:
+            return ""
         payload = msg.get_payload(decode=True)
         if payload is None:
-            # not encoded — may already be str
-            raw = msg.get_payload()
-            return str(raw or "").strip()
+            return str(msg.get_payload() or "").strip()
         try:
             return payload.decode(
                 msg.get_content_charset() or "utf-8", errors="replace"
@@ -191,6 +197,14 @@ def _extract_plain_text(msg: "email.message.Message") -> str:
             return ""
     except Exception:
         return ""
+
+
+def _extract_plain_text(msg: "email.message.Message") -> str:
+    return _extract_body_part(msg, "text/plain")
+
+
+def _extract_html_body(msg: "email.message.Message") -> str:
+    return _extract_body_part(msg, "text/html")
 
 
 def _parse_mailbox_line(line: bytes) -> Optional[str]:
@@ -202,7 +216,6 @@ def _parse_mailbox_line(line: bytes) -> Optional[str]:
     text = text.strip()
     if not text:
         return None
-    # Prefer last quoted string: (\HasNoChildren) "/" "INBOX.Sent"
     quoted = re.findall(r'"([^"]*)"', text)
     if quoted:
         return quoted[-1]
@@ -222,63 +235,33 @@ def _parse_fetch_uid(meta: bytes) -> Optional[str]:
     return None
 
 
-# ---------- Structured logging with correlation IDs ----------
+# ---------- IMAP ID (RFC 2971, for 126/163) ----------
 
-class CorrelationLogger:
-    """Logger with automatic correlation ID injection."""
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self.correlation_id: Optional[str] = None
-
-    def set_correlation_id(self, corr_id: Optional[str] = None) -> str:
-        self.correlation_id = corr_id or str(uuid.uuid4())[:8]
-        return self.correlation_id
-
-    def _log(self, level: int, msg: str, *args, **kwargs):
-        extra = kwargs.pop("extra", {})
-        if self.correlation_id:
-            extra["correlation_id"] = self.correlation_id
-        self.logger.log(level, msg, *args, extra=extra, **kwargs)
-
-    def debug(self, msg: str, *args, **kwargs): self._log(logging.DEBUG, msg, *args, **kwargs)
-    def info(self, msg: str, *args, **kwargs): self._log(logging.INFO, msg, *args, **kwargs)
-    def warning(self, msg: str, *args, **kwargs): self._log(logging.WARNING, msg, *args, **kwargs)
-    def error(self, msg: str, *args, **kwargs): self._log(logging.ERROR, msg, *args, **kwargs)
-    def exception(self, msg: str, *args, **kwargs): self._log(logging.ERROR, msg, *args, exc_info=True, **kwargs)
-
-
-LOG = CorrelationLogger(logging.getLogger("email_skill"))
-
-
-# ---------- IMAP ID Support (RFC 2971 for 126/163) ----------
-
-def _send_imap_id(conn, host: str, port: int) -> None:
-    """Send IMAP ID command (RFC 2971) for providers like 126/163 that require it."""
-    if not IMAP_REQUIRE_ID:
+def _send_imap_id(conn, require: bool = False) -> None:
+    if not (require or IMAP_REQUIRE_ID):
         return
-    
-    # Send CAPABILITY first to check support
     try:
-        typ, _ = conn.capability()
+        cap = getattr(conn, "capability", None)
+        if cap is not None:
+            cap()
     except Exception:
         pass
-    
-    # Send ID command with client identification
-    id_params = '("name" "imap-skill") ("version" "1.0") ("vendor" "kilo-code")'
     try:
-        typ, resp = conn._simple_command(b"ID", id_params.encode())
+        sender = getattr(conn, "_simple_command", None)
+        if sender is None:
+            return
+        typ, resp = sender(b"ID", b'("name" "imap-skill" "version" "2.0")')
         if typ != "OK":
-            LOG.warning(f"IMAP ID command failed: {resp}")
+            LOG.warning("IMAP ID command failed: %r", resp)
     except Exception as e:
-        LOG.warning(f"IMAP ID command error: {e}")
+        LOG.warning("IMAP ID command error: %s", e)
 
 
-# ---------- SMTP Client ----------
+# ---------- SMTP ----------
 
 def _get_smtp_config() -> Dict[str, Any]:
-    """Get SMTP configuration from environment."""
     return {
-        "host": SMTP_HOST or _env_token("IMAP_HOST", "smtp.gmail.com"),
+        "host": SMTP_HOST or "smtp.gmail.com",
         "port": SMTP_PORT,
         "use_ssl": SMTP_USE_SSL,
         "user": SMTP_USER or os.getenv("IMAP_USER", ""),
@@ -287,32 +270,30 @@ def _get_smtp_config() -> Dict[str, Any]:
 
 
 def _create_smtp_client(config: Dict[str, Any]):
-    """Create and authenticate SMTP client."""
     import smtplib
-    
-    host = config["host"]
-    port = config["port"]
-    user = config["user"]
-    password = config["password"]
-    use_ssl = config["use_ssl"]
-    
-    if use_ssl:
+
+    host, port = config["host"], config["port"]
+    if config["use_ssl"]:
         client = smtplib.SMTP_SSL(host, port, timeout=DEFAULT_TIMEOUT)
+        client.ehlo()
     else:
         client = smtplib.SMTP(host, port, timeout=DEFAULT_TIMEOUT)
+        client.ehlo()
         client.starttls(context=ssl.create_default_context())
-    
-    client.login(user, password)
+        client.ehlo()
+    client.login(config["user"], config["password"])
     return client
 
 
 def _send_smtp_message(msg: MIMEMultipart, config: Dict[str, Any]) -> None:
-    """Send message via SMTP."""
     client = _create_smtp_client(config)
     try:
         client.send_message(msg)
     finally:
-        client.quit()
+        try:
+            client.quit()
+        except Exception:
+            pass
 
 
 def _build_message(
@@ -324,7 +305,6 @@ def _build_message(
     in_reply_to: Optional[str] = None,
     references: Optional[str] = None,
 ) -> MIMEMultipart:
-    """Build MIME message with proper headers."""
     msg = MIMEMultipart()
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
@@ -333,194 +313,102 @@ def _build_message(
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = f"<{uuid.uuid4()}@imap-skill>"
-    
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
-        refs = references or ""
-        msg["References"] = f"{refs} {in_reply_to}".strip()
-    
+        msg["References"] = f"{references or ''} {in_reply_to}".strip()
     msg.attach(MIMEText(body, "plain", "utf-8"))
     return msg
 
 
 def _extract_email_address(addr_str: str) -> str:
-    """Extract email address from 'Name <addr>' format."""
     if not addr_str:
         return ""
-    # Try to extract from <addr> format
-    import re
     m = re.search(r"<([^>]+)>", addr_str)
     if m:
-        return m.group(1)
-    # If no brackets, check if it looks like an email
-    if "@" in addr_str:
-        return addr_str.strip()
-    return addr_str
+        return m.group(1).strip()
+    return addr_str.strip() if "@" in addr_str else addr_str
 
 
 def _extract_email_addresses(header_value: str) -> List[str]:
-    """Extract all email addresses from a header value."""
     if not header_value:
         return []
-    addrs = getaddresses([header_value])
-    return [addr for _, addr in addrs if addr]
+    return [addr for _, addr in getaddresses([header_value]) if addr]
 
 
 def _quote_original(body: str, from_label: str) -> str:
-    """Format original message body as inline quote."""
-    lines = body.split("\n")
-    quoted = "\n".join(f"> {line}" for line in lines)
+    quoted = "\n".join(f"> {line}" for line in body.split("\n"))
     return f"\n---- {from_label} wrote ----\n{quoted}\n--------------------------------"
 
 
-# ---------- Preset Configurations ----------
+# ---------- Presets ----------
 
 PRESETS = {
-    "gmail": {
-        "name": "Gmail",
-        "imap_host": "imap.gmail.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.gmail.com",
-        "smtp_port": 587,
-        "smtp_use_ssl": False,  # STARTTLS
-    },
-    "outlook": {
-        "name": "Outlook / Hotmail / Office 365",
-        "imap_host": "outlook.office365.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.office365.com",
-        "smtp_port": 587,
-        "smtp_use_ssl": False,  # STARTTLS
-    },
-    "qq": {
-        "name": "QQ Mail",
-        "imap_host": "imap.qq.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.qq.com",
-        "smtp_port": 465,
-        "smtp_use_ssl": True,
-    },
-    "163": {
-        "name": "163 NetEase",
-        "imap_host": "imap.163.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": True,
-        "smtp_host": "smtp.163.com",
-        "smtp_port": 465,
-        "smtp_use_ssl": True,
-    },
-    "126": {
-        "name": "126 NetEase",
-        "imap_host": "imap.126.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": True,
-        "smtp_host": "smtp.126.com",
-        "smtp_port": 465,
-        "smtp_use_ssl": True,
-    },
-    "tencent": {
-        "name": "Tencent Enterprise Mail",
-        "imap_host": "imap.exmail.qq.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.exmail.qq.com",
-        "smtp_port": 465,
-        "smtp_use_ssl": True,
-    },
-    "yahoo": {
-        "name": "Yahoo Mail",
-        "imap_host": "imap.mail.yahoo.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.mail.yahoo.com",
-        "smtp_port": 465,
-        "smtp_use_ssl": True,
-    },
-    "icloud": {
-        "name": "iCloud Mail",
-        "imap_host": "imap.mail.me.com",
-        "imap_port": 993,
-        "imap_use_ssl": True,
-        "imap_require_id": False,
-        "smtp_host": "smtp.mail.me.com",
-        "smtp_port": 587,
-        "smtp_use_ssl": False,  # STARTTLS
-    },
+    "gmail": {"name": "Gmail", "imap_host": "imap.gmail.com", "imap_port": 993,
+              "imap_use_ssl": True, "imap_require_id": False,
+              "smtp_host": "smtp.gmail.com", "smtp_port": 587, "smtp_use_ssl": False},
+    "outlook": {"name": "Outlook / Hotmail / Office 365", "imap_host": "outlook.office365.com",
+                "imap_port": 993, "imap_use_ssl": True, "imap_require_id": False,
+                "smtp_host": "smtp.office365.com", "smtp_port": 587, "smtp_use_ssl": False},
+    "qq": {"name": "QQ Mail", "imap_host": "imap.qq.com", "imap_port": 993,
+           "imap_use_ssl": True, "imap_require_id": False,
+           "smtp_host": "smtp.qq.com", "smtp_port": 465, "smtp_use_ssl": True},
+    "163": {"name": "163 NetEase", "imap_host": "imap.163.com", "imap_port": 993,
+            "imap_use_ssl": True, "imap_require_id": True,
+            "smtp_host": "smtp.163.com", "smtp_port": 465, "smtp_use_ssl": True},
+    "126": {"name": "126 NetEase", "imap_host": "imap.126.com", "imap_port": 993,
+            "imap_use_ssl": True, "imap_require_id": True,
+            "smtp_host": "smtp.126.com", "smtp_port": 465, "smtp_use_ssl": True},
+    "tencent": {"name": "Tencent Enterprise Mail", "imap_host": "imap.exmail.qq.com",
+                "imap_port": 993, "imap_use_ssl": True, "imap_require_id": False,
+                "smtp_host": "smtp.exmail.qq.com", "smtp_port": 465, "smtp_use_ssl": True},
+    "yahoo": {"name": "Yahoo Mail", "imap_host": "imap.mail.yahoo.com", "imap_port": 993,
+              "imap_use_ssl": True, "imap_require_id": False,
+              "smtp_host": "smtp.mail.yahoo.com", "smtp_port": 465, "smtp_use_ssl": True},
+    "icloud": {"name": "iCloud Mail", "imap_host": "imap.mail.me.com", "imap_port": 993,
+               "imap_use_ssl": True, "imap_require_id": False,
+               "smtp_host": "smtp.mail.me.com", "smtp_port": 587, "smtp_use_ssl": False},
 }
 
-
-def _apply_preset(preset_key: str) -> Dict[str, str]:
-    """Apply preset configuration, return env var mappings."""
-    preset = PRESETS.get(preset_key.lower())
-    if not preset:
-        return {}
-    return {
-        "IMAP_HOST": preset["imap_host"],
-        "IMAP_PORT": str(preset["imap_port"]),
-        "IMAP_USE_SSL": str(preset["imap_use_ssl"]).lower(),
-        "IMAP_REQUIRE_ID": str(preset["imap_require_id"]).lower(),
-        "SMTP_HOST": preset["smtp_host"],
-        "SMTP_PORT": str(preset["smtp_port"]),
-        "SMTP_USE_SSL": str(preset["smtp_use_ssl"]).lower(),
-    }
-
-
-# ---------- Interactive Init Wizard ----------
 
 def _run_init_wizard() -> int:
     """Interactive configuration wizard."""
     print("=" * 60)
     print("  imap-skill Configuration Wizard")
-    print("=" * 60)
-    print()
-    
-    # Check if .env exists
+    print("=" * 60 + "\n")
+
     base = os.path.dirname(os.path.abspath(__file__))
     env_path = os.path.join(base, ".env")
-    
     if os.path.exists(env_path):
-        overwrite = input(f".env already exists at {env_path}. Overwrite? [y/N]: ").strip().lower()
-        if overwrite not in ("y", "yes"):
+        if input(f".env already exists at {env_path}. Overwrite? [y/N]: ").strip().lower() not in ("y", "yes"):
             print("Cancelled.")
             return 1
-    
-    print("\nSelect email provider preset:")
-    preset_keys = list(PRESETS.keys())
-    for i, key in enumerate(preset_keys):
+
+    keys = list(PRESETS.keys())
+    print("Select email provider preset:")
+    for i, key in enumerate(keys):
         print(f"  {i + 1}. {PRESETS[key]['name']} ({key})")
-    print(f"  {len(preset_keys) + 1}. Custom / Other")
-    print()
-    
-    choice = input(f"Enter choice [1-{len(preset_keys) + 1}]: ").strip()
+    print(f"  {len(keys) + 1}. Custom / Other\n")
+    preset = None
     try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(preset_keys):
-            preset = PRESETS[preset_keys[idx]]
+        idx = int(input(f"Enter choice [1-{len(keys) + 1}]: ").strip()) - 1
+        if 0 <= idx < len(keys):
+            preset = PRESETS[keys[idx]]
             print(f"\nSelected: {preset['name']}")
         else:
-            preset = None
             print("\nCustom configuration selected.")
     except (ValueError, IndexError):
-        preset = None
         print("\nInvalid choice, using custom configuration.")
-    
-    # Collect credentials
+
+    def ask(prompt: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        val = input(f"{prompt}{suffix}: ").strip()
+        return val or default
+
     print("\n--- Credentials ---")
-    email_addr = input("Email address: ").strip()
+    email_addr = ask("Email address")
     if not email_addr:
         print("Error: Email address is required.")
         return 1
-    
     print("\nApp password / authorization code (not your login password):")
     print("  - Gmail: Google Account > Security > App Passwords")
     print("  - Outlook: Account > Security > App passwords")
@@ -529,410 +417,156 @@ def _run_init_wizard() -> int:
     if not password:
         print("Error: Password is required.")
         return 1
-    
-    display_name = input("Display name (optional): ").strip()
-    
-    # Build .env content
+
+    if preset:
+        imap_host, imap_port = preset["imap_host"], str(preset["imap_port"])
+        imap_ssl, imap_id = str(preset["imap_use_ssl"]).lower(), str(preset["imap_require_id"]).lower()
+        smtp_host, smtp_port = preset["smtp_host"], str(preset["smtp_port"])
+        smtp_ssl = str(preset["smtp_use_ssl"]).lower()
+    else:
+        imap_host = ask("IMAP Host")
+        imap_port = ask("IMAP Port", "993")
+        imap_ssl, imap_id = "true", "false"
+        smtp_host = ask("SMTP Host")
+        smtp_port = ask("SMTP Port", "465")
+        smtp_ssl = "true"
+
     lines = [
         "# imap-skill configuration",
         f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
         "# IMAP Settings",
-        f"IMAP_HOST={preset['imap_host'] if preset else input('IMAP Host: ').strip()}",
-        f"IMAP_PORT={preset['imap_port'] if preset else input('IMAP Port [993]: ').strip() or '993'}",
-        f"IMAP_USE_SSL={str(preset['imap_use_ssl']).lower() if preset else 'true'}",
-        f"IMAP_REQUIRE_ID={str(preset['imap_require_id']).lower() if preset else 'false'}",
+        f"IMAP_HOST={imap_host}",
+        f"IMAP_PORT={imap_port}",
+        f"IMAP_USE_SSL={imap_ssl}",
+        f"IMAP_REQUIRE_ID={imap_id}",
         f"IMAP_USER={email_addr}",
         f"IMAP_PASSWORD={password}",
         "",
         "# SMTP Settings",
-        f"SMTP_HOST={preset['smtp_host'] if preset else input('SMTP Host: ').strip()}",
-        f"SMTP_PORT={preset['smtp_port'] if preset else input('SMTP Port [465]: ').strip() or '465'}",
-        f"SMTP_USE_SSL={str(preset['smtp_use_ssl']).lower() if preset else 'true'}",
+        f"SMTP_HOST={smtp_host}",
+        f"SMTP_PORT={smtp_port}",
+        f"SMTP_USE_SSL={smtp_ssl}",
         f"SMTP_USER={email_addr}",
         f"SMTP_PASSWORD={password}",
         "",
         "# Optional Settings",
-        f"MAX_BODY_CHARS=8000",
-        f"LOG_LEVEL=INFO",
-        f"IMAP_POOL_SIZE=2",
-        f"IMAP_IDLE_TIMEOUT=300",
-        f"IMAP_BACKUP_DIR=~/imap_backup",
+        "MAX_BODY_CHARS=8000",
+        "LOG_LEVEL=INFO",
+        "IMAP_BACKUP_DIR=~/imap_backup",
     ]
-    
-    if display_name:
-        lines.insert(3, f"# Display Name: {display_name}")
-    
     print("\n--- Preview ---")
-    print("\n".join(lines))
+    print("\n".join(lines if "PASSWORD" not in l else l.split("=")[0] + "=***" for l in lines))
     print("---")
-    
-    confirm = input("\nSave to .env? [Y/n]: ").strip().lower()
-    if confirm in ("", "y", "yes"):
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        # Secure permissions
-        try:
-            os.chmod(env_path, 0o600)
-        except Exception:
-            pass
-        print(f"\n✓ Configuration saved to {env_path}")
-        print("  You can now use the CLI or start the MCP server.")
-        return 0
-    else:
+    if input("\nSave to .env? [Y/n]: ").strip().lower() not in ("", "y", "yes"):
         print("\nCancelled.")
         return 1
-
-
-# ---------- Connection Pool ----------
-
-class ImapConnectionPool:
-    """Thread-safe IMAP connection pool with keepalive."""
-
-    def __init__(self, host: str, port: int, use_ssl: bool, user: str, password: str, timeout: int, require_id: bool = False):
-        self.host = host
-        self.port = port
-        self.use_ssl = use_ssl
-        self.user = user
-        self.password = password
-        self.timeout = timeout
-        self.require_id = require_id
-        self._pool: List[imaplib.IMAP4] = []
-        self._lock = threading.Lock()
-        self._in_use: set = set()
-        self._created_at: Dict[imaplib.IMAP4, float] = {}
-        self._last_used: Dict[imaplib.IMAP4, float] = {}
-        self._keepalive_thread: Optional[threading.Thread] = None
-        self._stop_keepalive = threading.Event()
-
-    def _create_connection(self) -> imaplib.IMAP4:
-        """Create a new IMAP connection."""
-        if self.use_ssl:
-            conn = imaplib.IMAP4_SSL(self.host, self.port, timeout=self.timeout)
-        else:
-            conn = imaplib.IMAP4(self.host, self.port, timeout=self.timeout)
-            conn = _upgrade_to_tls(conn, self.host, self.port)
-        conn.login(self.user, self.password)
-        # Send IMAP ID if required (for 126/163 NetEase)
-        _send_imap_id(conn, self.host, self.port)
-        return conn
-
-    @staticmethod
-    def _read_caps(conn) -> set:
-        return _read_caps(conn)
-
-    def _is_connection_valid(self, conn: imaplib.IMAP4) -> bool:
-        """Check if connection is still alive with NOOP."""
-        try:
-            typ, _ = conn.noop()
-            return typ == "OK"
-        except Exception:
-            return False
-
-    def get_connection(self) -> imaplib.IMAP4:
-        """Get a connection from the pool or create a new one."""
-        with self._lock:
-            # Try to reuse an existing connection
-            while self._pool:
-                conn = self._pool.pop()
-                if self._is_connection_valid(conn):
-                    self._in_use.add(conn)
-                    self._last_used[conn] = time.time()
-                    LOG.debug("Reused pooled connection", extra={"pool_size": len(self._pool)})
-                    return conn
-                else:
-                    LOG.debug("Discarded stale connection")
-                    try:
-                        conn.logout()
-                    except Exception:
-                        pass
-
-            # Create new connection if pool exhausted
-            if len(self._in_use) < CONNECTION_POOL_SIZE:
-                conn = self._create_connection()
-                self._in_use.add(conn)
-                self._created_at[conn] = time.time()
-                self._last_used[conn] = time.time()
-                LOG.debug("Created new connection", extra={"active": len(self._in_use)})
-                return conn
-
-            # Pool exhausted - wait for a connection to be returned
-            raise RuntimeError("Connection pool exhausted")
-
-    def return_connection(self, conn: imaplib.IMAP4) -> None:
-        """Return a connection to the pool."""
-        with self._lock:
-            if conn in self._in_use:
-                self._in_use.remove(conn)
-                if self._is_connection_valid(conn):
-                    self._pool.append(conn)
-                    self._last_used[conn] = time.time()
-                    LOG.debug("Returned connection to pool", extra={"pool_size": len(self._pool)})
-                else:
-                    LOG.debug("Discarded invalid connection on return")
-                    try:
-                        conn.logout()
-                    except Exception:
-                        pass
-                    self._cleanup_connection(conn)
-
-    def _cleanup_connection(self, conn: imaplib.IMAP4) -> None:
-        """Clean up connection tracking."""
-        self._created_at.pop(conn, None)
-        self._last_used.pop(conn, None)
-
-    def close_all(self) -> None:
-        """Close all connections in the pool."""
-        with self._lock:
-            for conn in self._pool:
-                try:
-                    conn.logout()
-                except Exception:
-                    pass
-            self._pool.clear()
-            for conn in self._in_use:
-                try:
-                    conn.logout()
-                except Exception:
-                    pass
-            self._in_use.clear()
-            self._created_at.clear()
-            self._last_used.clear()
-            LOG.info("Closed all connections in pool")
-
-    def start_keepalive(self) -> None:
-        """Start background keepalive thread."""
-        if self._keepalive_thread and self._keepalive_thread.is_alive():
-            return
-        self._stop_keepalive.clear()
-        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
-        self._keepalive_thread.start()
-        LOG.debug("Started keepalive thread")
-
-    def stop_keepalive(self) -> None:
-        """Stop background keepalive thread."""
-        self._stop_keepalive.set()
-        if self._keepalive_thread:
-            self._keepalive_thread.join(timeout=5)
-        LOG.debug("Stopped keepalive thread")
-
-    def _keepalive_loop(self) -> None:
-        """Periodically send NOOP to keep connections alive."""
-        while not self._stop_keepalive.is_set():
-            time.sleep(60)  # Check every minute
-            if self._stop_keepalive.is_set():
-                break
-
-            with self._lock:
-                now = time.time()
-                # Check idle connections
-                stale_conns = []
-                for conn in self._pool[:]:
-                    last_used = self._last_used.get(conn, 0)
-                    if now - last_used > CONNECTION_IDLE_TIMEOUT:
-                        stale_conns.append(conn)
-
-                for conn in stale_conns:
-                    LOG.debug("Closing idle connection")
-                    self._pool.remove(conn)
-                    try:
-                        conn.logout()
-                    except Exception:
-                        pass
-                    self._cleanup_connection(conn)
-
-                # Send NOOP to active connections
-                for conn in list(self._in_use):
-                    try:
-                        conn.noop()
-                    except Exception:
-                        LOG.debug("NOOP failed, connection may be dead")
-                        self._in_use.remove(conn)
-                        try:
-                            conn.logout()
-                        except Exception:
-                            pass
-                        self._cleanup_connection(conn)
-
-
-# ---------- Offline Backup Helpers ----------
-
-def _extract_html_body(msg: "email.message.Message") -> str:
-    """Extract first non-attachment text/html body; '' when none."""
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
     try:
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.is_multipart():
-                    continue
-                if part.get_content_type() != "text/html":
-                    continue
-                if part.get_content_disposition() == "attachment":
-                    continue
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                try:
-                    return payload.decode(
-                        part.get_content_charset() or "utf-8", errors="replace"
-                    ).strip()
-                except Exception:
-                    continue
-            return ""
-        if msg.get_content_type() == "text/html":
-            payload = msg.get_payload(decode=True)
-            if payload is None:
-                raw = msg.get_payload()
-                return str(raw or "").strip()
-            try:
-                return payload.decode(
-                    msg.get_content_charset() or "utf-8", errors="replace"
-                ).strip()
-            except Exception:
-                return ""
+        os.chmod(env_path, 0o600)
     except Exception:
-        return ""
-    return ""
+        pass
+    print(f"\nConfiguration saved to {env_path}")
+    return 0
 
+
+# ---------- IMAP open ----------
+
+def _open_imap(host: str, port: int, use_ssl: bool, timeout: int):
+    """Create an IMAP connection (SSL or STARTTLS). Fixes missing _upgrade_to_tls."""
+    if not HAVE_IMAP or imaplib is None:
+        raise RuntimeError("imaplib/email unavailable in this interpreter")
+    if use_ssl:
+        return imaplib.IMAP4_SSL(host, port, timeout=timeout)
+    conn = imaplib.IMAP4(host, port, timeout=timeout)
+    try:
+        conn.starttls(ssl.create_default_context())
+    except Exception as e:
+        LOG.warning("STARTTLS failed on %s:%s: %s", host, port, e)
+    return conn
+
+
+# ---------- Offline backup ----------
 
 def _extract_attachments(msg: "email.message.Message", backup_dir: Path, uid: str) -> List[Dict[str, Any]]:
-    """Extract and save attachments, return list of attachment info."""
-    attachments = []
+    attachments: List[Dict[str, Any]] = []
     backup_dir.mkdir(parents=True, exist_ok=True)
-
     for i, part in enumerate(msg.walk()):
-        if part.is_multipart():
+        if part.is_multipart() or part.get_content_disposition() != "attachment":
             continue
-        if part.get_content_disposition() != "attachment":
-            continue
-
-        fname = part.get_filename() or f"unnamed-attachment-{i}"
-        fname = _decode_mime(fname)
-
+        fname = _decode_mime(part.get_filename() or f"unnamed-attachment-{i}")
         payload = part.get_payload(decode=True)
         if not payload:
             continue
-
-        # Save attachment
-        safe_fname = re.sub(r'[<>:"/\\|?*]', '_', fname)
-        ext = Path(safe_fname).suffix
-        if not ext:
-            ext = mimetypes.guess_extension(part.get_content_type()) or ""
+        safe = re.sub(r'[<>:"/\\|?*]', "_", fname)
+        ext = Path(safe).suffix or mimetypes.guess_extension(part.get_content_type()) or ""
         save_name = f"{uid}_{i}{ext}"
         save_path = backup_dir / save_name
-
         try:
             save_path.write_bytes(payload)
-            attachments.append({
-                "original_name": fname,
-                "saved_as": save_name,
-                "size": len(payload),
-                "content_type": part.get_content_type(),
-                "path": str(save_path)
-            })
+            attachments.append({"original_name": fname, "saved_as": save_name,
+                                "size": len(payload), "content_type": part.get_content_type(),
+                                "path": str(save_path)})
         except Exception as e:
-            LOG.warning(f"Failed to save attachment {fname}: {e}")
-
+            LOG.warning("Failed to save attachment %s: %s", fname, e)
     return attachments
 
 
-def _save_email_as_html(
-    msg: "email.message.Message",
-    mailbox: str,
-    uid: str,
-    backup_dir: Path,
-    include_attachments: bool = True
-) -> Dict[str, Any]:
-    """Save email as HTML file with embedded resources."""
+def _save_email_as_html(msg, mailbox: str, uid: str, backup_dir: Path,
+                        include_attachments: bool = True) -> Dict[str, Any]:
     backup_dir.mkdir(parents=True, exist_ok=True)
-
-    # Extract headers
     subject = _decode_mime(msg.get("Subject", ""))
     from_addr = _decode_mime(msg.get("From", ""))
     to_addr = _decode_mime(msg.get("To", ""))
     date = msg.get("Date", "")
     message_id = msg.get("Message-ID", "")
 
-    # Extract HTML body
     html_body = _extract_html_body(msg)
     plain_body = _extract_plain_text(msg)
-
-    # Use HTML if available, otherwise convert plain text
     if not html_body and plain_body:
-        html_body = f"<pre>{html_body.replace('&', '&').replace('<', '<').replace('>', '>')}</pre>"
+        html_body = f"<pre>{html.escape(plain_body)}</pre>"
     elif not html_body:
         html_body = "<p><em>No body content</em></p>"
 
-    # Extract attachments
-    attachments = []
-    if include_attachments:
-        attachments = _extract_attachments(msg, backup_dir, uid)
+    attachments = _extract_attachments(msg, backup_dir, uid) if include_attachments else []
+    att_html = ""
+    if attachments:
+        links = "".join(
+            f'<div class="attachment"><a href="{html.escape(a["saved_as"])}">'
+            f'{html.escape(a["original_name"])}</a> ({a["size"]} bytes)</div>'
+            for a in attachments)
+        att_html = f'<div class="attachments"><h2>Attachments ({len(attachments)})</h2>{links}</div>'
 
-    # Generate HTML file
-    html_content = f"""<!DOCTYPE html>
+    page = f"""<!DOCTYPE html>
 <html>
-<head>
-    <meta charset="utf-8">
-    <title>{subject}</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }}
-        .header {{ border-bottom: 1px solid #ddd; padding-bottom: 1rem; margin-bottom: 1rem; }}
-        .header h1 {{ margin: 0 0 0.5rem 0; font-size: 1.5rem; }}
-        .meta {{ color: #666; font-size: 0.9rem; }}
-        .meta div {{ margin: 0.25rem 0; }}
-        .body {{ line-height: 1.6; }}
-        .attachments {{ margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #ddd; }}
-        .attachment {{ display: inline-block; margin: 0.5rem; padding: 0.5rem; background: #f5f5f5; border-radius: 4px; }}
-    </style>
+<head><meta charset="utf-8"><title>{html.escape(subject)}</title>
+<style>body{{font-family:sans-serif;max-width:800px;margin:2rem auto;padding:0 1rem}}
+.header{{border-bottom:1px solid #ddd;padding-bottom:1rem;margin-bottom:1rem}}
+.meta{{color:#666;font-size:.9rem}}.body{{line-height:1.6}}
+.attachments{{margin-top:2rem;padding-top:1rem;border-top:1px solid #ddd}}
+.attachment{{display:inline-block;margin:.5rem;padding:.5rem;background:#f5f5f5;border-radius:4px}}</style>
 </head>
-<body>
-    <div class="header">
-        <h1>{subject}</h1>
-        <div class="meta">
-            <div><strong>From:</strong> {from_addr}</div>
-            <div><strong>To:</strong> {to_addr}</div>
-            <div><strong>Date:</strong> {date}</div>
-            <div><strong>Message-ID:</strong> {message_id}</div>
-            <div><strong>Mailbox:</strong> {mailbox}</div>
-            <div><strong>UID:</strong> {uid}</div>
-        </div>
-    </div>
-    <div class="body">
-        {html_body}
-    </div>
-    {f'<div class="attachments"><h2>Attachments ({len(attachments)})</h2>' + ''.join(f'<div class="attachment"><a href="{a["saved_as"]}">{a["original_name"]}</a> ({a["size"]} bytes)</div>' for a in attachments) + '</div>' if attachments else ''}
-</body>
-</html>"""
+<body><div class="header"><h1>{html.escape(subject)}</h1>
+<div class="meta"><div><strong>From:</strong> {html.escape(from_addr)}</div>
+<div><strong>To:</strong> {html.escape(to_addr)}</div>
+<div><strong>Date:</strong> {html.escape(date)}</div>
+<div><strong>Message-ID:</strong> {html.escape(message_id)}</div>
+<div><strong>Mailbox:</strong> {html.escape(mailbox)}</div>
+<div><strong>UID:</strong> {html.escape(uid)}</div></div></div>
+<div class="body">{html_body}</div>{att_html}</body></html>"""
 
-    # Save HTML file
-    safe_subject = re.sub(r'[<>:"/\\|?*]', '_', subject)[:100]
-    html_filename = f"{uid}_{safe_subject}.html"
-    html_path = backup_dir / html_filename
-    html_path.write_text(html_content, encoding="utf-8")
-
-    return {
-        "html_file": str(html_path),
-        "subject": subject,
-        "from": from_addr,
-        "to": to_addr,
-        "date": date,
-        "message_id": message_id,
-        "mailbox": mailbox,
-        "uid": uid,
-        "attachments": attachments,
-        "has_html_body": bool(_extract_html_body(msg)),
-        "has_plain_body": bool(plain_body)
-    }
+    safe_subject = re.sub(r'[<>:"/\\|?*]', "_", subject)[:100]
+    html_path = backup_dir / f"{uid}_{safe_subject}.html"
+    html_path.write_text(page, encoding="utf-8")
+    return {"html_file": str(html_path), "subject": subject, "from": from_addr,
+            "to": to_addr, "date": date, "message_id": message_id,
+            "mailbox": mailbox, "uid": uid, "attachments": attachments,
+            "has_html_body": bool(_extract_html_body(msg)), "has_plain_body": bool(plain_body)}
 
 
 class ImapClient:
-    """
-    Real IMAP transport backed by environment variables.
-    Uses connection pool for efficient connection reuse.
-    Throws network/connection exceptions; no simulated fallback intended.
-    Usable as a context manager: `with ImapClient.connect_once() as c: ...`
-    """
-    _pool: Optional["ImapConnectionPool"] = None
-    _pool_lock = threading.Lock()
+    """Direct IMAP transport (one connection per client, no pool)."""
 
     def __init__(self):
         self.host = _env_token("IMAP_HOST", "imap.gmail.com")
@@ -950,54 +584,45 @@ class ImapClient:
         self.password = os.getenv("IMAP_PASSWORD")
         self.timeout = DEFAULT_TIMEOUT
         self._conn = None
-        self._pool_conn = None
-        self._corr_id = None
-
-    @classmethod
-    def _get_pool(cls) -> "ImapConnectionPool":
-        """Get or create the global connection pool."""
-        with cls._pool_lock:
-            if cls._pool is None:
-                if not HAVE_IMAP:
-                    raise RuntimeError("imaplib/email unavailable in this interpreter")
-                if not os.getenv("IMAP_USER") or not os.getenv("IMAP_PASSWORD"):
-                    raise RuntimeError("IMAP_USER and IMAP_PASSWORD must be set (env or .env)")
-                if any(c.isspace() for c in os.getenv("IMAP_USER", "")):
-                    raise RuntimeError("IMAP_USER must be the bare email address with no spaces")
-                cls._pool = ImapConnectionPool(
-                    host=_env_token("IMAP_HOST", "imap.gmail.com"),
-                    port=_env_int("IMAP_PORT", 993),
-                    use_ssl=_env_token("IMAP_USE_SSL", "true").lower() in ("1", "true", "yes", "y", "on", "auto"),
-                    user=os.getenv("IMAP_USER", ""),
-                    password=os.getenv("IMAP_PASSWORD", ""),
-                    timeout=DEFAULT_TIMEOUT,
-                    require_id=IMAP_REQUIRE_ID,
-                )
-                cls._pool.start_keepalive()
-            return cls._pool
-
-    def _acquire_connection(self) -> None:
-        """Acquire a connection from the pool."""
-        pool = self._get_pool()
-        self._pool_conn = pool.get_connection()
-        self._conn = self._pool_conn
-        self._corr_id = LOG.set_correlation_id()
-
-    def _release_connection(self) -> None:
-        """Release connection back to the pool."""
-        if self._pool_conn:
-            pool = self._get_pool()
-            pool.return_connection(self._pool_conn)
-            self._pool_conn = None
-            self._conn = None
 
     # -- lifecycle --
     def connect(self) -> None:
-        """Acquire connection from pool; raises RuntimeError on any failure."""
-        self._acquire_connection()
+        if self._conn:
+            return
+        if not HAVE_IMAP:
+            raise RuntimeError("imaplib/email unavailable in this interpreter")
+        if not self.user or not self.password:
+            raise RuntimeError("IMAP_USER and IMAP_PASSWORD must be set (env or .env)")
+        if any(c.isspace() for c in self.user):
+            raise RuntimeError("IMAP_USER must be the bare email address with no spaces")
+        conn = _open_imap(self.host, self.port, self.use_ssl, self.timeout)
+        try:
+            conn.login(self.user, self.password)
+        except Exception:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            raise
+        _send_imap_id(conn)
+        try:
+            if getattr(conn, "capability", None):
+                conn.capability()
+        except Exception:
+            pass
+        self._conn = conn
 
     def close(self) -> None:
-        self._release_connection()
+        if self._conn is not None:
+            try:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn.logout()
+            except Exception:
+                pass
+            self._conn = None
 
     def __enter__(self) -> "ImapClient":
         self.connect()
@@ -1014,45 +639,29 @@ class ImapClient:
 
     @classmethod
     def close_pool(cls) -> None:
-        """Close all connections in the pool (for shutdown)."""
-        with cls._pool_lock:
-            if cls._pool:
-                cls._pool.stop_keepalive()
-                cls._pool.close_all()
-                cls._pool = None
+        """No-op kept for backward compatibility (pool removed)."""
 
     # -- internals --
     def _require_conn(self) -> None:
         if not self._conn:
             raise RuntimeError("Not connected to IMAP (call connect() first)")
 
+    def _caps(self) -> set:
+        caps = set()
+        for c in getattr(self._conn, "capabilities", None) or ():
+            caps.add(c.decode("ascii", "ignore").upper() if isinstance(c, bytes) else str(c).upper())
+        return caps
+
     def _has_cap(self, name: str) -> bool:
         try:
-            caps = getattr(self._conn, "capabilities", None) or ()
-            norm = []
-            for c in caps:
-                if isinstance(c, bytes):
-                    norm.append(c.decode("ascii", "ignore").upper())
-                else:
-                    norm.append(str(c).upper())
-            return name.upper() in norm
+            if not self._caps():
+                try:
+                    self._conn.capability()
+                except Exception:
+                    pass
+            return name.upper() in self._caps()
         except Exception:
             return False
-
-    @staticmethod
-    def _read_caps(conn) -> set:
-        """Refresh (CAPABILITY command when available) and normalize caps."""
-        try:
-            cap_cmd = getattr(conn, "capability", None)
-            if cap_cmd is not None:
-                cap_cmd()
-        except Exception:
-            pass
-        caps = set()
-        for c in getattr(conn, "capabilities", None) or ():
-            caps.add(c.decode("ascii", "ignore").upper()
-                     if isinstance(c, bytes) else str(c).upper())
-        return caps
 
     def _select(self, mailbox: str, readonly: bool) -> None:
         self._require_conn()
@@ -1060,9 +669,55 @@ class ImapClient:
         if typ != "OK":
             raise RuntimeError(f"Cannot select mailbox {mailbox!r}")
 
-    # ---------- Tool implementations ----------
+    def _fetch_original(self, mailbox: str, uid: str):
+        """Fetch full message by UID (BODY.PEEK: no Seen side effect)."""
+        self._select(mailbox, readonly=True)
+        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
+        if typ != "OK" or not data or not data[0]:
+            raise RuntimeError(f"UID {uid} not found")
+        first = data[0]
+        raw = first[1] if isinstance(first, tuple) else first
+        if not raw:
+            raise RuntimeError(f"UID {uid} not found")
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8", "replace")
+        return email.message_from_bytes(raw)
+
+    def _reply_addrs(self, orig_msg, reply_all: bool):
+        config = _get_smtp_config()
+        from_addr = config["user"]
+        orig_from = _decode_mime(orig_msg.get("From", ""))
+        to_addrs = [_extract_email_address(orig_from)]
+        cc_addrs: List[str] = []
+        if reply_all:
+            wanted = _extract_email_addresses(_decode_mime(orig_msg.get("To", ""))) \
+                + _extract_email_addresses(_decode_mime(orig_msg.get("Cc", "")))
+            me = (from_addr or "").lower()
+            sender = _extract_email_address(orig_from).lower()
+            seen = set()
+            for addr in wanted:
+                low = addr.lower()
+                if low in seen or low == me or low == sender:
+                    continue
+                seen.add(low)
+                cc_addrs.append(addr)
+        return config, from_addr, to_addrs, cc_addrs
+
+    def _append_mime(self, mailbox: str, msg: MIMEMultipart, flags: str = "(\\Draft)") -> None:
+        if HAVE_IMAP and imaplib is not None:
+            internal_date = imaplib.Time2Internaldate(time.time())
+        else:
+            internal_date = time.strftime("%d-%b-%Y %H:%M:%S +0000", time.gmtime())
+        typ, _ = self._conn.append(mailbox, flags, internal_date, msg.as_bytes())
+        if typ != "OK":
+            raise RuntimeError("Draft append failed")
+
+    @staticmethod
+    def _with_prefix(subject: str, prefix: str) -> str:
+        return subject if subject.upper().startswith(prefix.upper()) else f"{prefix} {subject}"
+
+    # ---------- tools ----------
     def list_mailboxes(self) -> List[str]:
-        """Return a list of folder names (INBOX, Sent, Drafts, ...)."""
         self._require_conn()
         typ, data = self._conn.list()
         if typ != "OK":
@@ -1076,15 +731,9 @@ class ImapClient:
                 out.append(name)
         return out
 
-    def search_messages(self,
-                        mailbox: str = "INBOX",
-                        criteria: str = "ALL",
+    def search_messages(self, mailbox: str = "INBOX", criteria: str = "ALL",
                         limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Run UID SEARCH and page results (most recent `limit`).
-        Single batched FETCH (1 round-trip) instead of N per-message fetches.
-        Returns [{uid, subject, from, to, date}].
-        """
+        """UID SEARCH, most recent `limit`; single batched header FETCH."""
         self._require_conn()
         try:
             limit = int(limit)
@@ -1106,10 +755,8 @@ class ImapClient:
         if not uid_list:
             return []
         wanted = uid_list[-limit:]
-        uid_set = b",".join(wanted)
-
         typ, raw = self._conn.uid(
-            "FETCH", uid_set,
+            "FETCH", b",".join(wanted),
             "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO DATE)])",
         )
         if typ != "OK":
@@ -1128,37 +775,21 @@ class ImapClient:
             headers_by_uid[uid] = header_bytes or b""
             order.append(uid)
 
-        # Preserve UID order requested (ascending); fall back to server order.
-        ordered_uids = [_uid_to_str(u) for u in wanted if _uid_to_str(u) in headers_by_uid]
-        if not ordered_uids:
-            ordered_uids = order
-
-        results: List[Dict[str, Any]] = []
-        for uid in ordered_uids:
+        ordered = [_uid_to_str(u) for u in wanted if _uid_to_str(u) in headers_by_uid] or order
+        results = []
+        for uid in ordered:
             try:
                 msg = email.message_from_bytes(headers_by_uid.get(uid, b""))
             except Exception:
                 continue
-            results.append({
-                "uid": uid,
-                "subject": _decode_mime(msg.get("Subject", "")),
-                "from": _decode_mime(msg.get("From", "")),
-                "to": _decode_mime(msg.get("To", "")),
-                "date": msg.get("Date", "") or "",
-            })
+            results.append({"uid": uid, "subject": _decode_mime(msg.get("Subject", "")),
+                            "from": _decode_mime(msg.get("From", "")),
+                            "to": _decode_mime(msg.get("To", "")),
+                            "date": msg.get("Date", "") or ""})
         return results
 
-    def fetch_message(self,
-                      mailbox: str,
-                      uid: str,
-                      include_body: bool = True,
+    def fetch_message(self, mailbox: str, uid: str, include_body: bool = True,
                       max_body_chars: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Fetch full message metadata + plain-text body.
-        BODY.PEEK avoids marking the message Seen as a side effect.
-        Body truncated to max_body_chars (env MAX_BODY_CHARS default 8000);
-        suffix appended only when actually truncated.
-        """
         self._require_conn()
         if max_body_chars is None:
             max_body_chars = DEFAULT_MAX_BODY_CHARS
@@ -1169,73 +800,34 @@ class ImapClient:
         if isinstance(include_body, str):
             include_body = include_body.strip().lower() in ("1", "true", "yes", "y")
 
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        msg = email.message_from_bytes(raw_msg)
-
+        msg = self._fetch_original(mailbox, uid)
         body = ""
         if include_body:
-            full = _extract_plain_text(msg)  # single pass (was called twice)
-            if len(full) > max_body_chars:
-                body = full[:max_body_chars] + TRUNCATION_SUFFIX
-            else:
-                body = full
+            full = _extract_plain_text(msg)
+            body = full[:max_body_chars] + TRUNCATION_SUFFIX if len(full) > max_body_chars else full
+        return {"uid": _uid_to_str(uid), "subject": _decode_mime(msg.get("Subject", "")),
+                "from": _decode_mime(msg.get("From", "")), "to": _decode_mime(msg.get("To", "")),
+                "date": msg.get("Date", "") or "", "body": body}
 
-        return {
-            "uid": _uid_to_str(uid),
-            "subject": _decode_mime(msg.get("Subject", "")),
-            "from": _decode_mime(msg.get("From", "")),
-            "to": _decode_mime(msg.get("To", "")),
-            "date": msg.get("Date", "") or "",
-            "body": body,
-        }
-
-    def mark_message(self,
-                     mailbox: str,
-                     uid: str,
-                     flag: str = "\\Seen",
+    def mark_message(self, mailbox: str, uid: str, flag: str = "\\Seen",
                      add: bool = True) -> Dict[str, Any]:
-        """Add or remove IMAP flag via STORE."""
         self._require_conn()
         if isinstance(add, str):
             add = add.strip().lower() in ("1", "true", "yes", "y")
         self._select(mailbox, readonly=False)
-        op = "+FLAGS" if add else "-FLAGS"
-        typ, _ = self._conn.uid("STORE", str(uid), op, flag)
+        typ, _ = self._conn.uid("STORE", str(uid), "+FLAGS" if add else "-FLAGS", flag)
         if typ != "OK":
             raise RuntimeError(f"Failed to {'add' if add else 'remove'} flag {flag}")
-        return {
-            "status": "ok",
-            "uid": _uid_to_str(uid),
-            "flag": flag,
-            "added": bool(add),
-        }
+        return {"status": "ok", "uid": _uid_to_str(uid), "flag": flag, "added": bool(add)}
 
-    def move_message(self,
-                     mailbox: str = "",
-                     uid: str = "",
-                     dest: str = "",
+    def move_message(self, mailbox: str = "", uid: str = "", dest: str = "",
                      **aliases: Any) -> Dict[str, Any]:
-        """
-        MOVE UID if supported, else COPY + STORE \\Deleted + EXPUNGE.
-        Canonical arg names: mailbox, uid, dest.
-        Backward-compat aliases: mailbox_src/mailbox_dest/source/destination.
-        """
         src = mailbox or aliases.get("mailbox_src") or aliases.get("source") or ""
         dst = dest or aliases.get("mailbox_dest") or aliases.get("destination") or ""
         if not src or not uid or not dst:
             raise RuntimeError("move_message requires mailbox, uid and dest")
         self._require_conn()
         self._select(src, readonly=False)
-
         if self._has_cap("MOVE"):
             typ, _ = self._conn.uid("MOVE", str(uid), dst)
             if typ != "OK":
@@ -1249,25 +841,13 @@ class ImapClient:
                 raise RuntimeError("COPY succeeded but flagging original \\Deleted failed")
             if self._has_cap("UIDPLUS"):
                 typ, _ = self._conn.uid("EXPUNGE", str(uid))
-                if typ != "OK":
-                    raise RuntimeError("Copy ok, but UID EXPUNGE failed")
             else:
                 typ, _ = self._conn.expunge()
-                if typ != "OK":
-                    raise RuntimeError("Copy ok, but EXPUNGE failed")
+            if typ != "OK":
+                raise RuntimeError("Copy ok, but EXPUNGE failed")
+        return {"status": "ok", "uid": _uid_to_str(uid), "source": src, "destination": dst}
 
-        return {
-            "status": "ok",
-            "uid": _uid_to_str(uid),
-            "source": src,
-            "destination": dst,
-        }
-
-    def delete_message(self,
-                       mailbox: str,
-                       uid: str,
-                       expunge: bool = False) -> Dict[str, Any]:
-        """STORE +FLAGS \\Deleted; expunge when requested."""
+    def delete_message(self, mailbox: str, uid: str, expunge: bool = False) -> Dict[str, Any]:
         self._require_conn()
         if isinstance(expunge, str):
             expunge = expunge.strip().lower() in ("1", "true", "yes", "y")
@@ -1279,23 +859,14 @@ class ImapClient:
         if expunge:
             if self._has_cap("UIDPLUS"):
                 typ, _ = self._conn.uid("EXPUNGE", str(uid))
-                if typ != "OK":
-                    raise RuntimeError("Expunge failed")
             else:
                 typ, _ = self._conn.expunge()
-                if typ != "OK":
-                    raise RuntimeError("Expunge failed")
+            if typ != "OK":
+                raise RuntimeError("Expunge failed")
             expunged = True
-        return {
-            "status": "ok",
-            "uid": _uid_to_str(uid),
-            "expunged": expunged,
-        }
+        return {"status": "ok", "uid": _uid_to_str(uid), "expunged": expunged}
 
-    def append_draft(self,
-                     mailbox: str,
-                     raw_message: str) -> Dict[str, Any]:
-        """Append raw RFC822 message to a mailbox (default Drafts)."""
+    def append_draft(self, mailbox: str, raw_message: str) -> Dict[str, Any]:
         self._require_conn()
         if not raw_message:
             raise RuntimeError("raw_message must not be empty")
@@ -1303,744 +874,274 @@ class ImapClient:
             internal_date = imaplib.Time2Internaldate(time.time())
         else:
             internal_date = time.strftime("%d-%b-%Y %H:%M:%S +0000", time.gmtime())
-        typ, _ = self._conn.append(
-            mailbox, "(\\Draft)", internal_date, raw_message.encode("utf-8")
-        )
+        typ, _ = self._conn.append(mailbox, "(\\Draft)", internal_date, raw_message.encode("utf-8"))
         if typ != "OK":
             raise RuntimeError("Draft append failed")
         return {"status": "ok", "mailbox": mailbox}
 
-    def list_attachments(self,
-                         mailbox: str,
-                         uid: str,
-                         max_links: int = 3) -> Dict[str, Any]:
-        """List attachment names (BODY.PEEK: no Seen side effect)."""
+    def list_attachments(self, mailbox: str, uid: str, max_links: int = 3) -> Dict[str, Any]:
         self._require_conn()
         try:
             max_links = int(max_links)
         except (TypeError, ValueError):
             raise RuntimeError("max_links must be an integer")
         max_links = max(0, min(max_links, 50))
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        msg = email.message_from_bytes(raw_msg)
-        names: List[str] = []
-        for i, part in enumerate(msg.walk()):
-            if part.is_multipart():
-                continue
-            if part.get_content_disposition() != "attachment":
-                continue
-            fname = part.get_filename() or f"unnamed-attachment-{i}"
-            names.append(_decode_mime(fname))
-        return {
-            "uid": _uid_to_str(uid),
-            "mailbox": mailbox,
-            "attachment_count": len(names),
-            "attachments": names[:max_links] if max_links else [],
-        }
+        msg = self._fetch_original(mailbox, uid)
+        names = [_decode_mime(p.get_filename() or f"unnamed-attachment-{i}")
+                 for i, p in enumerate(msg.walk())
+                 if not p.is_multipart() and p.get_content_disposition() == "attachment"]
+        return {"uid": _uid_to_str(uid), "mailbox": mailbox,
+                "attachment_count": len(names), "attachments": names[:max_links] if max_links else []}
 
-    def save_email_as_html(self,
-                           mailbox: str,
-                           uid: str,
-                           include_attachments: bool = True,
+    def save_email_as_html(self, mailbox: str, uid: str, include_attachments: bool = True,
                            backup_dir: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Save an email as an HTML file with embedded resources for offline backup.
-
-        Args:
-            mailbox: Source mailbox name
-            uid: Message UID
-            include_attachments: Whether to extract and save attachments
-            backup_dir: Custom backup directory (uses IMAP_BACKUP_DIR env var if not specified)
-
-        Returns:
-            Dict with html_file path, metadata, and attachment info
-        """
         self._require_conn()
         if isinstance(include_attachments, str):
             include_attachments = include_attachments.strip().lower() in ("1", "true", "yes", "y")
+        path = Path(backup_dir).expanduser() if backup_dir else Path(BACKUP_DIR).expanduser()
+        return _save_email_as_html(self._fetch_original(mailbox, uid), mailbox,
+                                   _uid_to_str(uid), path, include_attachments)
 
-        backup_path = Path(backup_dir) if backup_dir else Path(BACKUP_DIR)
-
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        msg = email.message_from_bytes(raw_msg)
-
-        return _save_email_as_html(msg, mailbox, uid, backup_path, include_attachments)
-
-    # ---------- SMTP-based Tools ----------
-    
-    def send_message(self,
-                     to: str,
-                     subject: str,
-                     body: str,
+    # ---------- SMTP-based tools ----------
+    def send_message(self, to: str, subject: str, body: str,
                      cc: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Send a new email message via SMTP.
-        
-        Args:
-            to: Recipient email address(es), comma-separated
-            subject: Email subject
-            body: Plain text body
-            cc: CC recipients, comma-separated (optional)
-            
-        Returns:
-            Dict with status
-        """
         config = _get_smtp_config()
-        from_addr = config["user"]
-        
-        to_addrs = [addr.strip() for addr in to.split(",") if addr.strip()]
-        cc_addrs = [addr.strip() for addr in cc.split(",") if addr.strip()] if cc else []
-        
+        to_addrs = [a.strip() for a in to.split(",") if a.strip()]
+        cc_addrs = [a.strip() for a in cc.split(",") if a.strip()] if cc else []
         if not to_addrs:
             raise RuntimeError("At least one recipient (to) is required")
         if not subject:
             raise RuntimeError("Subject is required")
         if not body:
             raise RuntimeError("Body is required")
-        
-        msg = _build_message(from_addr, to_addrs, subject, body, cc_addrs)
-        _send_smtp_message(msg, config)
-        
-        return {
-            "status": "sent",
-            "from": from_addr,
-            "to": to_addrs,
-            "cc": cc_addrs,
-            "subject": subject,
-        }
+        _send_smtp_message(_build_message(config["user"], to_addrs, subject, body, cc_addrs), config)
+        return {"status": "sent", "from": config["user"], "to": to_addrs,
+                "cc": cc_addrs, "subject": subject}
 
-    def reply_message(self,
-                      mailbox: str,
-                      uid: str,
-                      body: str,
+    def reply_message(self, mailbox: str, uid: str, body: str,
                       reply_all: bool = False) -> Dict[str, Any]:
-        """
-        Reply to an email message.
-        
-        Args:
-            mailbox: Source mailbox
-            uid: Message UID to reply to
-            body: Reply body text
-            reply_all: Whether to reply to all recipients
-            
-        Returns:
-            Dict with status
-        """
         self._require_conn()
         if not body:
             raise RuntimeError("Reply body is required")
-        
-        # Fetch original message
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        orig_msg = email.message_from_bytes(raw_msg)
-        
-        # Extract original headers
-        orig_from = _decode_mime(orig_msg.get("From", ""))
-        orig_to = _decode_mime(orig_msg.get("To", ""))
-        orig_cc = _decode_mime(orig_msg.get("Cc", ""))
-        orig_subject = _decode_mime(orig_msg.get("Subject", ""))
-        orig_message_id = orig_msg.get("Message-ID", "")
-        orig_references = orig_msg.get("References", "")
-        
-        config = _get_smtp_config()
-        from_addr = config["user"]
-        
-        # Build recipient lists
-        to_addrs = [_extract_email_address(orig_from)]
-        
-        cc_addrs = []
-        if reply_all:
-            # Add original To and Cc (except ourselves and original sender)
-            all_recipients = _extract_email_addresses(orig_to) + _extract_email_addresses(orig_cc)
-            self_addr = from_addr.lower()
-            sender_addr = _extract_email_address(orig_from).lower()
-            for addr in all_recipients:
-                addr_lower = addr.lower()
-                if addr_lower != self_addr and addr_lower != sender_addr:
-                    cc_addrs.append(addr)
-        
-        # Build subject with Re: prefix
-        if not orig_subject.upper().startswith("RE:"):
-            subject = f"Re: {orig_subject}"
-        else:
-            subject = orig_subject
-        
-        # Build body with quoted original
-        orig_body = _extract_plain_text(orig_msg)
-        full_body = body + _quote_original(orig_body, orig_from)
-        
-        msg = _build_message(
-            from_addr, to_addrs, subject, full_body, cc_addrs,
-            in_reply_to=orig_message_id, references=orig_references
-        )
-        _send_smtp_message(msg, config)
-        
-        return {
-            "status": "sent",
-            "from": from_addr,
-            "to": to_addrs,
-            "cc": cc_addrs,
-            "subject": subject,
-            "in_reply_to": orig_message_id,
-        }
+        if isinstance(reply_all, str):
+            reply_all = reply_all.strip().lower() in ("1", "true", "yes", "y")
+        orig = self._fetch_original(mailbox, uid)
+        orig_from = _decode_mime(orig.get("From", ""))
+        config, from_addr, to_addrs, cc_addrs = self._reply_addrs(orig, reply_all)
+        subject = self._with_prefix(_decode_mime(orig.get("Subject", "")), "Re:")
+        full_body = body + _quote_original(_extract_plain_text(orig), orig_from)
+        msg_id = orig.get("Message-ID", "")
+        _send_smtp_message(_build_message(from_addr, to_addrs, subject, full_body, cc_addrs,
+                                          in_reply_to=msg_id,
+                                          references=orig.get("References", "")), config)
+        return {"status": "sent", "from": from_addr, "to": to_addrs,
+                "cc": cc_addrs, "subject": subject, "in_reply_to": msg_id}
 
-    def forward_message(self,
-                        mailbox: str,
-                        uid: str,
-                        to: str,
-                        body: str = "") -> Dict[str, Any]:
-        """
-        Forward an email message.
-        
-        Args:
-            mailbox: Source mailbox
-            uid: Message UID to forward
-            to: Recipient email address(es), comma-separated
-            body: Additional text to prepend (optional)
-            
-        Returns:
-            Dict with status
-        """
+    def forward_message(self, mailbox: str, uid: str, to: str, body: str = "") -> Dict[str, Any]:
         self._require_conn()
-        
-        to_addrs = [addr.strip() for addr in to.split(",") if addr.strip()]
+        to_addrs = [a.strip() for a in to.split(",") if a.strip()]
         if not to_addrs:
             raise RuntimeError("At least one recipient (to) is required")
-        
-        # Fetch original message
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        orig_msg = email.message_from_bytes(raw_msg)
-        
-        # Extract original headers
-        orig_from = _decode_mime(orig_msg.get("From", ""))
-        orig_subject = _decode_mime(orig_msg.get("Subject", ""))
-        orig_date = orig_msg.get("Date", "")
-        
+        orig = self._fetch_original(mailbox, uid)
+        orig_from = _decode_mime(orig.get("From", ""))
+        orig_subject = _decode_mime(orig.get("Subject", ""))
         config = _get_smtp_config()
-        from_addr = config["user"]
-        
-        # Build subject with Fwd: prefix
-        if not orig_subject.upper().startswith("FWD:"):
-            subject = f"Fwd: {orig_subject}"
-        else:
-            subject = orig_subject
-        
-        # Build body
-        orig_body = _extract_plain_text(orig_msg)
-        header = f"---------- Forwarded message ----------\nFrom: {orig_from}\nDate: {orig_date}\nSubject: {orig_subject}\n\n"
-        full_body = body + "\n" + header + orig_body if body else header + orig_body
-        
-        msg = _build_message(from_addr, to_addrs, subject, full_body)
-        _send_smtp_message(msg, config)
-        
-        return {
-            "status": "sent",
-            "from": from_addr,
-            "to": to_addrs,
-            "subject": subject,
-        }
+        subject = self._with_prefix(orig_subject, "Fwd:")
+        header = (f"---------- Forwarded message ----------\nFrom: {orig_from}\n"
+                  f"Date: {orig.get('Date', '')}\nSubject: {orig_subject}\n\n")
+        orig_body = _extract_plain_text(orig)
+        full_body = f"{body}\n{header}{orig_body}" if body else header + orig_body
+        _send_smtp_message(_build_message(config["user"], to_addrs, subject, full_body), config)
+        return {"status": "sent", "from": config["user"], "to": to_addrs, "subject": subject}
 
-    def draft_message(self,
-                      to: str,
-                      subject: str,
-                      body: str,
-                      cc: Optional[str] = None,
-                      mailbox: str = "Drafts") -> Dict[str, Any]:
-        """
-        Create a draft email in IMAP Drafts folder.
-        
-        Args:
-            to: Recipient email address(es), comma-separated
-            subject: Email subject
-            body: Plain text body
-            cc: CC recipients, comma-separated (optional)
-            mailbox: Target mailbox (default: Drafts)
-            
-        Returns:
-            Dict with status
-        """
+    def draft_message(self, to: str, subject: str, body: str,
+                      cc: Optional[str] = None, mailbox: str = "Drafts") -> Dict[str, Any]:
         self._require_conn()
-        
-        to_addrs = [addr.strip() for addr in to.split(",") if addr.strip()]
-        cc_addrs = [addr.strip() for addr in cc.split(",") if addr.strip()] if cc else []
-        
+        to_addrs = [a.strip() for a in to.split(",") if a.strip()]
+        cc_addrs = [a.strip() for a in cc.split(",") if a.strip()] if cc else []
         if not to_addrs:
             raise RuntimeError("At least one recipient (to) is required")
-        if not subject:
-            raise RuntimeError("Subject is required")
-        if not body:
-            raise RuntimeError("Body is required")
-        
+        if not subject or not body:
+            raise RuntimeError("Subject and body are required")
         config = _get_smtp_config()
-        from_addr = config["user"]
-        
-        msg = _build_message(from_addr, to_addrs, subject, body, cc_addrs)
-        
-        if HAVE_IMAP and imaplib is not None:
-            internal_date = imaplib.Time2Internaldate(time.time())
-        else:
-            internal_date = time.strftime("%d-%b-%Y %H:%M:%S +0000", time.gmtime())
-        
-        typ, _ = self._conn.append(
-            mailbox, "(\\Draft)", internal_date, msg.as_bytes()
-        )
-        if typ != "OK":
-            raise RuntimeError("Draft append failed")
-        
-        return {
-            "status": "ok",
-            "mailbox": mailbox,
-            "from": from_addr,
-            "to": to_addrs,
-            "cc": cc_addrs,
-            "subject": subject,
-        }
+        self._append_mime(mailbox, _build_message(config["user"], to_addrs, subject, body, cc_addrs))
+        return {"status": "ok", "mailbox": mailbox, "from": config["user"],
+                "to": to_addrs, "cc": cc_addrs, "subject": subject}
 
-    def draft_reply(self,
-                    mailbox: str,
-                    uid: str,
-                    body: str,
-                    reply_all: bool = False,
+    def draft_reply(self, mailbox: str, uid: str, body: str, reply_all: bool = False,
                     draft_mailbox: str = "Drafts") -> Dict[str, Any]:
-        """
-        Create a reply draft in IMAP Drafts folder.
-        
-        Args:
-            mailbox: Source mailbox
-            uid: Message UID to reply to
-            body: Reply body text
-            reply_all: Whether to reply to all recipients
-            draft_mailbox: Target mailbox for draft (default: Drafts)
-            
-        Returns:
-            Dict with status
-        """
         self._require_conn()
         if not body:
             raise RuntimeError("Reply body is required")
-        
-        # Fetch original message
-        self._select(mailbox, readonly=True)
-        typ, data = self._conn.uid("FETCH", str(uid), "(BODY.PEEK[])")
-        if typ != "OK" or not data or not data[0]:
-            raise RuntimeError(f"UID {uid} not found")
-        first = data[0]
-        raw_msg = first[1] if isinstance(first, tuple) else first
-        if not raw_msg:
-            raise RuntimeError(f"UID {uid} not found")
-        if isinstance(raw_msg, str):
-            raw_msg = raw_msg.encode("utf-8", "replace")
-        orig_msg = email.message_from_bytes(raw_msg)
-        
-        # Extract original headers
-        orig_from = _decode_mime(orig_msg.get("From", ""))
-        orig_to = _decode_mime(orig_msg.get("To", ""))
-        orig_cc = _decode_mime(orig_msg.get("Cc", ""))
-        orig_subject = _decode_mime(orig_msg.get("Subject", ""))
-        orig_message_id = orig_msg.get("Message-ID", "")
-        orig_references = orig_msg.get("References", "")
-        
-        config = _get_smtp_config()
-        from_addr = config["user"]
-        
-        # Build recipient lists
-        to_addrs = [_extract_email_address(orig_from)]
-        
-        cc_addrs = []
-        if reply_all:
-            all_recipients = _extract_email_addresses(orig_to) + _extract_email_addresses(orig_cc)
-            self_addr = from_addr.lower()
-            sender_addr = _extract_email_address(orig_from).lower()
-            for addr in all_recipients:
-                addr_lower = addr.lower()
-                if addr_lower != self_addr and addr_lower != sender_addr:
-                    cc_addrs.append(addr)
-        
-        # Build subject with Re: prefix
-        if not orig_subject.upper().startswith("RE:"):
-            subject = f"Re: {orig_subject}"
-        else:
-            subject = orig_subject
-        
-        # Build body with quoted original
-        orig_body = _extract_plain_text(orig_msg)
-        full_body = body + _quote_original(orig_body, orig_from)
-        
-        msg = _build_message(
+        if isinstance(reply_all, str):
+            reply_all = reply_all.strip().lower() in ("1", "true", "yes", "y")
+        orig = self._fetch_original(mailbox, uid)
+        orig_from = _decode_mime(orig.get("From", ""))
+        config, from_addr, to_addrs, cc_addrs = self._reply_addrs(orig, reply_all)
+        subject = self._with_prefix(_decode_mime(orig.get("Subject", "")), "Re:")
+        full_body = body + _quote_original(_extract_plain_text(orig), orig_from)
+        msg_id = orig.get("Message-ID", "")
+        self._append_mime(draft_mailbox, _build_message(
             from_addr, to_addrs, subject, full_body, cc_addrs,
-            in_reply_to=orig_message_id, references=orig_references
-        )
-        
-        if HAVE_IMAP and imaplib is not None:
-            internal_date = imaplib.Time2Internaldate(time.time())
-        else:
-            internal_date = time.strftime("%d-%b-%Y %H:%M:%S +0000", time.gmtime())
-        
-        typ, _ = self._conn.append(
-            draft_mailbox, "(\\Draft)", internal_date, msg.as_bytes()
-        )
-        if typ != "OK":
-            raise RuntimeError("Draft append failed")
-        
-        return {
-            "status": "ok",
-            "mailbox": draft_mailbox,
-            "from": from_addr,
-            "to": to_addrs,
-            "cc": cc_addrs,
-            "subject": subject,
-            "in_reply_to": orig_message_id,
-        }
+            in_reply_to=msg_id, references=orig.get("References", "")))
+        return {"status": "ok", "mailbox": draft_mailbox, "from": from_addr,
+                "to": to_addrs, "cc": cc_addrs, "subject": subject, "in_reply_to": msg_id}
 
-    # ---------- uniform dispatch (LLM / MCP / CLI) ----------
+    # ---------- uniform dispatch ----------
     def dispatch_tool(self, name: str, args: Optional[Dict[str, Any]] = None) -> Any:
         args = dict(args or {})
-        if name == "list_mailboxes":
-            return self.list_mailboxes()
-        if name == "search_messages":
-            return self.search_messages(
-                mailbox=args.get("mailbox", "INBOX"),
-                criteria=args.get("criteria", "ALL"),
-                limit=args.get("limit", 20),
-            )
-        if name == "fetch_message":
-            return self.fetch_message(
+        table = {
+            "list_mailboxes": lambda: self.list_mailboxes(),
+            "search_messages": lambda: self.search_messages(
+                mailbox=args.get("mailbox", "INBOX"), criteria=args.get("criteria", "ALL"),
+                limit=args.get("limit", 20)),
+            "fetch_message": lambda: self.fetch_message(
                 mailbox=args["mailbox"], uid=args["uid"],
                 include_body=args.get("include_body", True),
-                max_body_chars=args.get("max_body_chars", DEFAULT_MAX_BODY_CHARS),
-            )
-        if name == "mark_message":
-            return self.mark_message(
+                max_body_chars=args.get("max_body_chars", DEFAULT_MAX_BODY_CHARS)),
+            "mark_message": lambda: self.mark_message(
                 mailbox=args["mailbox"], uid=args["uid"],
-                flag=args.get("flag", "\\Seen"), add=args.get("add", True),
-            )
-        if name == "move_message":
-            return self.move_message(
+                flag=args.get("flag", "\\Seen"), add=args.get("add", True)),
+            "move_message": lambda: self.move_message(
                 mailbox=args.get("mailbox", args.get("mailbox_src", "")),
-                uid=args["uid"],
-                dest=args.get("dest", args.get("mailbox_dest", "")),
+                uid=args["uid"], dest=args.get("dest", args.get("mailbox_dest", "")),
                 **{k: v for k, v in args.items()
-                   if k in ("mailbox_src", "mailbox_dest", "source", "destination")},
-            )
-        if name == "delete_message":
-            return self.delete_message(
-                mailbox=args["mailbox"], uid=args["uid"],
-                expunge=args.get("expunge", False),
-            )
-        if name == "append_draft":
-            return self.append_draft(
-                mailbox=args.get("mailbox", "Drafts"),
-                raw_message=args["raw_message"],
-            )
-        if name == "list_attachments":
-            return self.list_attachments(
-                mailbox=args["mailbox"], uid=args["uid"],
-                max_links=args.get("max_links", 3),
-            )
-        if name == "save_email_as_html":
-            return self.save_email_as_html(
+                   if k in ("mailbox_src", "mailbox_dest", "source", "destination")}),
+            "delete_message": lambda: self.delete_message(
+                mailbox=args["mailbox"], uid=args["uid"], expunge=args.get("expunge", False)),
+            "append_draft": lambda: self.append_draft(
+                mailbox=args.get("mailbox", "Drafts"), raw_message=args["raw_message"]),
+            "list_attachments": lambda: self.list_attachments(
+                mailbox=args["mailbox"], uid=args["uid"], max_links=args.get("max_links", 3)),
+            "save_email_as_html": lambda: self.save_email_as_html(
                 mailbox=args["mailbox"], uid=args["uid"],
                 include_attachments=args.get("include_attachments", True),
-                backup_dir=args.get("backup_dir"),
-            )
-        if name == "send_message":
-            return self.send_message(
-                to=args["to"], subject=args["subject"],
-                body=args["body"], cc=args.get("cc"),
-            )
-        if name == "reply_message":
-            return self.reply_message(
-                mailbox=args["mailbox"], uid=args["uid"],
-                body=args["body"], reply_all=args.get("reply_all", False),
-            )
-        if name == "forward_message":
-            return self.forward_message(
-                mailbox=args["mailbox"], uid=args["uid"],
-                to=args["to"], body=args.get("body", ""),
-            )
-        if name == "draft_message":
-            return self.draft_message(
-                to=args["to"], subject=args["subject"],
-                body=args["body"], cc=args.get("cc"),
-                mailbox=args.get("mailbox", "Drafts"),
-            )
-        if name == "draft_reply":
-            return self.draft_reply(
-                mailbox=args["mailbox"], uid=args["uid"],
-                body=args["body"], reply_all=args.get("reply_all", False),
-                draft_mailbox=args.get("draft_mailbox", "Drafts"),
-            )
-        raise RuntimeError(f"Unknown tool: {name}")
+                backup_dir=args.get("backup_dir")),
+            "send_message": lambda: self.send_message(
+                to=args["to"], subject=args["subject"], body=args["body"], cc=args.get("cc")),
+            "reply_message": lambda: self.reply_message(
+                mailbox=args["mailbox"], uid=args["uid"], body=args["body"],
+                reply_all=args.get("reply_all", False)),
+            "forward_message": lambda: self.forward_message(
+                mailbox=args["mailbox"], uid=args["uid"], to=args["to"], body=args.get("body", "")),
+            "draft_message": lambda: self.draft_message(
+                to=args["to"], subject=args["subject"], body=args["body"], cc=args.get("cc"),
+                mailbox=args.get("mailbox", "Drafts")),
+            "draft_reply": lambda: self.draft_reply(
+                mailbox=args["mailbox"], uid=args["uid"], body=args["body"],
+                reply_all=args.get("reply_all", False),
+                draft_mailbox=args.get("draft_mailbox", "Drafts")),
+        }
+        try:
+            return table[name]()
+        except KeyError:
+            raise RuntimeError(f"Unknown tool: {name}")
 
 
 def canonical_tools_for_provider(provider: str) -> List[Dict[str, Any]]:
-    """
-    Single canonical JSON schema shared by every provider.
-    Optional params carry defaults and are NOT in `required`.
-    """
+    """Single canonical JSON schema shared by every provider."""
     return [
-        {
-            "name": "list_mailboxes",
-            "description": "List all available mailboxes.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-        {
-            "name": "search_messages",
-            "description": "Search messages with IMAP SEARCH syntax.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string", "default": "INBOX"},
-                    "criteria": {"type": "string", "default": "ALL"},
-                    "limit": {"type": "integer", "default": 20},
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "fetch_message",
-            "description": "Retrieve full details (headers + plain body) by UID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "include_body": {"type": "boolean", "default": True},
-                    "max_body_chars": {"type": "integer", "default": DEFAULT_MAX_BODY_CHARS},
-                },
-                "required": ["mailbox", "uid"],
-            },
-        },
-        {
-            "name": "mark_message",
-            "description": "Add or remove IMAP flag on a message.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "flag": {"type": "string", "default": "\\Seen"},
-                    "add": {"type": "boolean", "default": True},
-                },
-                "required": ["mailbox", "uid"],
-            },
-        },
-        {
-            "name": "move_message",
-            "description": "Move a message from one mailbox to another.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "dest": {"type": "string"},
-                },
-                "required": ["mailbox", "uid", "dest"],
-            },
-        },
-        {
-            "name": "delete_message",
-            "description": "Flag message as deleted and optionally expunge.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "expunge": {"type": "boolean", "default": False},
-                },
-                "required": ["mailbox", "uid"],
-            },
-        },
-        {
-            "name": "append_draft",
-            "description": "Create a new draft with raw RFC822 content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string", "default": "Drafts"},
-                    "raw_message": {"type": "string"},
-                },
-                "required": ["raw_message"],
-            },
-        },
-        {
-            "name": "list_attachments",
-            "description": "List attachment names for a message (count + up to max_links names).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "max_links": {"type": "integer", "default": 3},
-                },
-                "required": ["mailbox", "uid"],
-            },
-        },
-        {
-            "name": "save_email_as_html",
-            "description": "Save an email as HTML file with attachments for offline backup.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "include_attachments": {"type": "boolean", "default": True},
-                    "backup_dir": {"type": "string", "description": "Custom backup directory (optional)"},
-                },
-                "required": ["mailbox", "uid"],
-            },
-        },
-        {
-            "name": "send_message",
-            "description": "Send a new email via SMTP.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
-                    "subject": {"type": "string"},
-                    "body": {"type": "string", "description": "Plain text body"},
-                    "cc": {"type": "string", "description": "CC recipients, comma-separated (optional)"},
-                },
-                "required": ["to", "subject", "body"],
-            },
-        },
-        {
-            "name": "reply_message",
-            "description": "Reply to an email message.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "body": {"type": "string", "description": "Reply body text"},
-                    "reply_all": {"type": "boolean", "default": False, "description": "Reply to all recipients"},
-                },
-                "required": ["mailbox", "uid", "body"],
-            },
-        },
-        {
-            "name": "forward_message",
-            "description": "Forward an email message.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
-                    "body": {"type": "string", "description": "Additional text to prepend (optional)", "default": ""},
-                },
-                "required": ["mailbox", "uid", "to"],
-            },
-        },
-        {
-            "name": "draft_message",
-            "description": "Create a draft email in IMAP Drafts folder.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
-                    "subject": {"type": "string"},
-                    "body": {"type": "string", "description": "Plain text body"},
-                    "cc": {"type": "string", "description": "CC recipients, comma-separated (optional)"},
-                    "mailbox": {"type": "string", "default": "Drafts"},
-                },
-                "required": ["to", "subject", "body"],
-            },
-        },
-        {
-            "name": "draft_reply",
-            "description": "Create a reply draft in IMAP Drafts folder.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mailbox": {"type": "string"},
-                    "uid": {"type": "string"},
-                    "body": {"type": "string", "description": "Reply body text"},
-                    "reply_all": {"type": "boolean", "default": False},
-                    "draft_mailbox": {"type": "string", "default": "Drafts"},
-                },
-                "required": ["mailbox", "uid", "body"],
-            },
-        },
+        {"name": "list_mailboxes", "description": "List all available mailboxes.",
+         "parameters": {"type": "object", "properties": {}, "required": []}},
+        {"name": "search_messages", "description": "Search messages with IMAP SEARCH syntax.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string", "default": "INBOX"},
+                                       "criteria": {"type": "string", "default": "ALL"},
+                                       "limit": {"type": "integer", "default": 20}},
+                        "required": []}},
+        {"name": "fetch_message", "description": "Retrieve full details (headers + plain body) by UID.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "include_body": {"type": "boolean", "default": True},
+                                       "max_body_chars": {"type": "integer", "default": DEFAULT_MAX_BODY_CHARS}},
+                        "required": ["mailbox", "uid"]}},
+        {"name": "mark_message", "description": "Add or remove IMAP flag on a message.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "flag": {"type": "string", "default": "\\Seen"},
+                                       "add": {"type": "boolean", "default": True}},
+                        "required": ["mailbox", "uid"]}},
+        {"name": "move_message", "description": "Move a message from one mailbox to another.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "dest": {"type": "string"}},
+                        "required": ["mailbox", "uid", "dest"]}},
+        {"name": "delete_message", "description": "Flag message as deleted and optionally expunge.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "expunge": {"type": "boolean", "default": False}},
+                        "required": ["mailbox", "uid"]}},
+        {"name": "append_draft", "description": "Create a new draft with raw RFC822 content.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string", "default": "Drafts"},
+                                       "raw_message": {"type": "string"}},
+                        "required": ["raw_message"]}},
+        {"name": "list_attachments",
+         "description": "List attachment names for a message (count + up to max_links names).",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "max_links": {"type": "integer", "default": 3}},
+                        "required": ["mailbox", "uid"]}},
+        {"name": "save_email_as_html",
+         "description": "Save an email as HTML file with attachments for offline backup.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "include_attachments": {"type": "boolean", "default": True},
+                                       "backup_dir": {"type": "string", "description": "Custom backup directory (optional)"}},
+                        "required": ["mailbox", "uid"]}},
+        {"name": "send_message", "description": "Send a new email via SMTP.",
+         "parameters": {"type": "object",
+                        "properties": {"to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
+                                       "subject": {"type": "string"},
+                                       "body": {"type": "string", "description": "Plain text body"},
+                                       "cc": {"type": "string", "description": "CC recipients, comma-separated (optional)"}},
+                        "required": ["to", "subject", "body"]}},
+        {"name": "reply_message", "description": "Reply to an email message.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "body": {"type": "string", "description": "Reply body text"},
+                                       "reply_all": {"type": "boolean", "default": False}},
+                        "required": ["mailbox", "uid", "body"]}},
+        {"name": "forward_message", "description": "Forward an email message.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
+                                       "body": {"type": "string", "description": "Additional text to prepend (optional)", "default": ""}},
+                        "required": ["mailbox", "uid", "to"]}},
+        {"name": "draft_message", "description": "Create a draft email in IMAP Drafts folder.",
+         "parameters": {"type": "object",
+                        "properties": {"to": {"type": "string", "description": "Recipient email address(es), comma-separated"},
+                                       "subject": {"type": "string"}, "body": {"type": "string", "description": "Plain text body"},
+                                       "cc": {"type": "string", "description": "CC recipients, comma-separated (optional)"},
+                                       "mailbox": {"type": "string", "default": "Drafts"}},
+                        "required": ["to", "subject", "body"]}},
+        {"name": "draft_reply", "description": "Create a reply draft in IMAP Drafts folder.",
+         "parameters": {"type": "object",
+                        "properties": {"mailbox": {"type": "string"}, "uid": {"type": "string"},
+                                       "body": {"type": "string", "description": "Reply body text"},
+                                       "reply_all": {"type": "boolean", "default": False},
+                                       "draft_mailbox": {"type": "string", "default": "Drafts"}},
+                        "required": ["mailbox", "uid", "body"]}},
     ]
 
 
 def compile_tools(provider: str) -> List[Dict[str, Any]]:
-    """
-    Adapt the canonical schema to each provider's native tool format.
-    openai/deepseek → {"type":"function","function":{...}}
-    anthropic       → {"name","description","input_schema"}
-    gemini          → {"name","description","parameters"}
-    mcp             → {"name","description","inputSchema"}
-    anything else   → canonical [{"name","description","parameters"}]
-    """
+    """Adapt the canonical schema to each provider's native tool format."""
     canonical = canonical_tools_for_provider(provider)
     p = (provider or "").strip().lower()
     if p in ("openai", "deepseek"):
-        return [
-            {"type": "function",
-             "function": {"name": t["name"], "description": t["description"],
-                          "parameters": t["parameters"]}}
-            for t in canonical
-        ]
+        return [{"type": "function",
+                 "function": {"name": t["name"], "description": t["description"],
+                              "parameters": t["parameters"]}} for t in canonical]
     if p == "anthropic":
-        return [
-            {"name": t["name"], "description": t["description"],
-             "input_schema": t["parameters"]}
-            for t in canonical
-        ]
+        return [{"name": t["name"], "description": t["description"],
+                 "input_schema": t["parameters"]} for t in canonical]
     if p == "gemini":
-        return [
-            {"name": t["name"], "description": t["description"],
-             "parameters": t["parameters"]}
-            for t in canonical
-        ]
+        return [{"name": t["name"], "description": t["description"],
+                 "parameters": t["parameters"]} for t in canonical]
     if p == "mcp":
-        return [
-            {"name": t["name"], "description": t["description"],
-             "inputSchema": t["parameters"]}
-            for t in canonical
-        ]
+        return [{"name": t["name"], "description": t["description"],
+                 "inputSchema": t["parameters"]} for t in canonical]
     return canonical
 
 
@@ -2048,12 +1149,11 @@ def compile_tools(provider: str) -> List[Dict[str, Any]]:
 
 _INT_ARGS = {"limit", "max_body_chars", "max_links"}
 _BOOL_ARGS = {"add", "expunge", "include_body", "include_attachments", "reply_all"}
-_NEEDS_CONNECTION = {
-    "list_mailboxes", "search_messages", "fetch_message", "mark_message",
-    "move_message", "delete_message", "append_draft", "list_attachments",
-    "save_email_as_html", "send_message", "reply_message", "forward_message",
-    "draft_message", "draft_reply", "init",
-}
+_IMAP_TOOLS = {"list_mailboxes", "search_messages", "fetch_message", "mark_message",
+               "move_message", "delete_message", "append_draft", "list_attachments",
+               "save_email_as_html", "reply_message", "forward_message",
+               "draft_message", "draft_reply"}
+_SMTP_ONLY_TOOLS = {"send_message"}
 
 HELP_TEXT = """Universal IMAP Email Skill — CLI
 
@@ -2109,8 +1209,7 @@ def _parse_kv_args(items: List[str]) -> Dict[str, Any]:
     args: Dict[str, Any] = {}
     for item in items:
         if "=" not in item:
-            raise RuntimeError(
-                f"Bad argument {item!r}: expected key=value. See --help.")
+            raise RuntimeError(f"Bad argument {item!r}: expected key=value. See --help.")
         key, _, value = item.partition("=")
         key = key.strip()
         if not key:
@@ -2140,42 +1239,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_init_wizard()
 
     tool, rest = argv[0], argv[1:]
-    
-    # Tools that don't need IMAP connection
-    no_imap_tools = {"send_message"}
-    
-    if tool not in _NEEDS_CONNECTION:
+    if tool not in _IMAP_TOOLS and tool not in _SMTP_ONLY_TOOLS:
         print(json.dumps({"error": f"Unknown tool: {tool}. See --help."}))
         return 1
-    
     try:
         args = _parse_kv_args(rest)
     except Exception as e:
         print(json.dumps({"error": str(e)}))
         return 1
 
-    # Send message uses SMTP only, no IMAP connection needed
-    if tool in no_imap_tools:
-        # Create a minimal client just for dispatch
-        client = ImapClient()
-        try:
-            result = client.dispatch_tool(tool, args)
-        except TypeError as e:
-            print(json.dumps({"error": f"Bad arguments for {tool}: {e}"}))
-            return 1
-        except KeyError as e:
-            print(json.dumps({"error": f"Missing required argument {e} for {tool}"}))
-            return 1
-        print(json.dumps(result, indent=2, default=str))
-        return 0
-
-    # All other tools need IMAP connection
     client = ImapClient()
-    try:
-        client.connect()
-    except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        return 1
+    needs_imap = tool not in _SMTP_ONLY_TOOLS
+    if needs_imap:
+        try:
+            client.connect()
+        except Exception as e:
+            print(json.dumps({"error": str(e)}))
+            return 1
     try:
         try:
             result = client.dispatch_tool(tool, args)
