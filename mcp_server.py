@@ -8,8 +8,7 @@ Run by the host, NOT by hand:
 Requires (install yourself):  python -m pip install mcp
 Credentials: read from the workspace .env by main.py (IMAP_USER, IMAP_PASSWORD…).
 
-Tool calls reuse connections from a shared pool (IMAP_POOL_SIZE, default 2)
-for efficient concurrent agent use.
+Each tool call opens one IMAP connection and closes it on return.
 """
 
 import os
@@ -94,12 +93,12 @@ def list_attachments(mailbox: str, uid: str, max_links: int = 3) -> dict:
 
 @mcp.tool()
 def save_email_as_html(mailbox: str, uid: str, include_attachments: bool = True,
-                       backup_dir: str = "") -> dict:
+                       backup_dir: str | None = None) -> dict:
     """Save an email as HTML file with attachments for offline backup."""
     with ImapClient.connect_once() as c:
         return c.save_email_as_html(mailbox=mailbox, uid=uid,
                                     include_attachments=include_attachments,
-                                    backup_dir=backup_dir if backup_dir else None)
+                                    backup_dir=backup_dir)
 
 
 # --- SMTP-based tools (outbound email) ---
@@ -107,9 +106,7 @@ def save_email_as_html(mailbox: str, uid: str, include_attachments: bool = True,
 @mcp.tool()
 def send_message(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Send a new email via SMTP. to/cc: comma-separated addresses."""
-    # send_message doesn't need IMAP connection, uses SMTP directly
-    client = ImapClient()
-    return client.send_message(to=to, subject=subject, body=body, cc=cc if cc else None)
+    return ImapClient().send_message(to=to, subject=subject, body=body, cc=cc or None)
 
 
 @mcp.tool()
@@ -130,7 +127,7 @@ def forward_message(mailbox: str, uid: str, to: str, body: str = "") -> dict:
 def draft_message(to: str, subject: str, body: str, cc: str = "", mailbox: str = "Drafts") -> dict:
     """Create a draft email in IMAP Drafts folder."""
     with ImapClient.connect_once() as c:
-        return c.draft_message(to=to, subject=subject, body=body, cc=cc if cc else None, mailbox=mailbox)
+        return c.draft_message(to=to, subject=subject, body=body, cc=cc or None, mailbox=mailbox)
 
 
 @mcp.tool()
